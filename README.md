@@ -22,11 +22,12 @@ through the rest:
   This password only opens your calendars. It cannot open your mail,
   your photos, or your account, and you can delete it any time.
   Never type your real Apple password into this setup.
-- Building your login code. Open the file `setup.html` from the
-  connector in any browser. It works even with the internet switched
-  off, and it sends nothing anywhere. Type in your Apple ID email
-  and the special password, tap the button, and copy the code it
-  shows you.
+- Building your login code. Muse will show you the setup page right
+  here in the chat. Type in your Apple ID email and the special
+  password, tap the button, and copy the code it shows you. The page
+  runs entirely on your device, sends nothing anywhere, and saves
+  nothing. You can also open the file `setup.html` from the connector
+  in any browser if you prefer. It is the same page.
 - Pasting that code into Muse when it asks for it, in its secure
   form.
 - If Muse says it needs a second address too, it will show you
@@ -47,7 +48,7 @@ registers, is under Authentication below.
 | `connector.yaml` | The connector descriptor (`custom.icloud-calendar`). |
 | `bin/icloud-calendar` | The CLI (single file, stdlib only). |
 | `tests/` | Offline unit tests for the parser, RRULE expansion and the CalDAV multistatus reader. |
-| `setup.html` | Offline, single-file setup helper that builds the header value in the browser. Loads and sends nothing. |
+| `setup.html` | Offline, single-file setup helper that builds the header value in the browser. Loads and sends nothing. Muse shows it inline in the chat during setup. |
 | `AGENTS.md` | Coding agents working on this repo: layout, commands, hard rules. |
 | `CONTRIBUTING.md` | How to contribute. |
 
@@ -93,11 +94,12 @@ Muse guides document for Basic-auth services.
    Revocable there at any time, scoped to CalDAV/CardDAV only: no mail,
    photos or account access, and never the real Apple ID password.
 2. Build the header value on your own device — no terminal needed.
-   Open **`setup.html`** from this repo in any browser: it is one
+   Muse shows you **`setup.html`** right in the chat: it is one
    self-contained file that works with the internet switched off, loads
    and sends nothing, and is short enough to read in full. Type your
    Apple ID email and the app-specific password, tap “Build my value”,
-   and copy the result. Spaces are removed automatically.
+   and copy the result. Spaces are removed automatically. You can also
+   open the file in any browser if you prefer. It is the same page.
 
    Prefer a terminal? The page performs exactly this composition
    (`authorization_value()` in `bin/icloud-calendar`, unit tested

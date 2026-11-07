@@ -18,7 +18,9 @@ say so.
 - `setup.html` — offline setup helper. It must never load or send
   anything: no `fetch(`, `XMLHttpRequest`, `WebSocket`, `sendBeacon`,
   `<script src`, or `http://` / `https://` anywhere in the file.
-  There is a test enforcing this.
+  There is a test enforcing this. Muse shows it inline in the chat
+  during setup with `widget.create_html_file_widget` on this file.
+  The browser-file route is the fallback.
 
 ## Commands
 
