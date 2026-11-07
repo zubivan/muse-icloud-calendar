@@ -9,7 +9,7 @@ remains the system of record.
 
 | File | Who it is for |
 |---|---|
-| `CONNECTOR.md` | Muse itself. The operating contract: connection details, commands, and the full Limitations section. Read it first. |
+| `CONNECTOR.md` | Muse itself. The operating contract: connection details, commands, and the full Limits section. Read it first. |
 | `connector.yaml` | The connector descriptor (`custom.icloud-calendar`). |
 | `bin/icloud-calendar` | The CLI (single file, stdlib only). |
 | `tests/` | Offline unit tests for the parser, RRULE expansion and the CalDAV multistatus reader. |
@@ -90,10 +90,10 @@ Floating times (no timezone in the event) and date-only values are read
 in `ICLOUD_CALENDAR_TZ` when set (an IANA zone name), otherwise in
 Europe/Amsterdam.
 
-## Limitations
+## Limits
 
 The full list, written for Muse to follow, is in `CONNECTOR.md` under
-Limitations. The short version:
+Limits. The short version:
 
 - One secret only (the complete `Authorization` header value), registered
   twice: `custom.icloud-calendar` for `caldav.icloud.com` and

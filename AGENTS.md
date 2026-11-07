@@ -2,7 +2,7 @@
 
 Notes for coding agents working on this repo. The user-facing docs are
 `README.md`; the operator contract Muse follows at runtime is
-`CONNECTOR.md` — its Limitations section is authoritative. Do not weaken
+`CONNECTOR.md` — its Limits section is authoritative. Do not weaken
 a limitation to make a feature work; if a limitation blocks the task,
 say so.
 
@@ -57,6 +57,6 @@ removal with a read/search.
   (default Europe/Amsterdam). Do not hardcode another zone.
 - Keep the CLI stdlib-only and single-file. If a change needs a new
   dependency, stop and discuss it first.
-- When a change affects behaviour, update the tests, the Limitations
+- When a change affects behaviour, update the tests, the Limits
   section in `CONNECTOR.md`, and the short list in `README.md` in the
   same change.
