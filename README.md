@@ -88,6 +88,27 @@ Floating times (no timezone in the event) and date-only values are read
 in `ICLOUD_CALENDAR_TZ` when set (an IANA zone name), otherwise in
 Europe/Amsterdam.
 
+## Limitations
+
+The full list, written for Muse to follow, is in `CONNECTOR.md` under
+Limitations. The short version:
+
+- One secret only (the complete `Authorization` header value), registered
+  twice: `custom.icloud-calendar` for `caldav.icloud.com` and
+  `custom.icloud-calendar-p<NN>` for the account's partition host.
+  Hosts are fixed at registration; a new partition host needs a new
+  connection.
+- Nothing is cached; every call re-discovers live. Date-only ranges are
+  whole days in `ICLOUD_CALENDAR_TZ` (default Europe/Amsterdam), `--to`
+  exclusive.
+- Recurrence expansion covers DAILY / WEEKLY / MONTHLY / YEARLY with
+  INTERVAL, COUNT, UNTIL, BYDAY, BYMONTHDAY, EXDATE and RECURRENCE-ID
+  overrides. Anything else is returned unexpanded — check the raw
+  iCalendar with `get` before relying on it.
+- Writes use ETag preconditions; a 412 means re-read and retry, never
+  force. The helper never sends invitations or notifies guests.
+- Calendars only: no tasks, reminders, contacts, mail or files.
+
 ## Tests
 
 ```sh
@@ -96,6 +117,15 @@ python3 -m unittest discover -s tests
 
 Offline only: parsing, recurrence expansion, multistatus XML, ICS building.
 Live verification is a separate, explicit step against the real account.
+
+Verify a live setup end to end with a harmless read first, then a
+throwaway event:
+
+```sh
+icloud-calendar status       # base credential entry present?
+icloud-calendar calendars    # live discovery; proves both connections
+```
+
 ## Security notes
 
 - Authenticated requests never auto-follow redirects. The CLI follows a

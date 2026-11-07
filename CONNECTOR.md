@@ -1,6 +1,6 @@
 # iCloud Calendar
 
-Read this file first. It is the contract for operating this connector: what it does, which hosts it may call, and how to operate it. Do not work around a limitation by guessing — say what is missing and stop at that step.
+Read this file first. It is the contract for operating this connector: what it does, which hosts it may call, and the limitations in the Limitations section below. Do not work around a limitation by guessing — say what is missing and stop at that step.
 
 - `custom.icloud-calendar` connects Muse to the user's iCloud calendars through Apple's CalDAV service. Apple Calendar stays the system of record and this connector is only a client.
 
@@ -95,6 +95,43 @@ icloud-calendar delete --uid <event-uid>
 - Creating an event with guests, and any change that would notify guests, needs the user's confirmation first, matching the scheduling skill. This helper does not send invitations itself.
 
 - After a write, read the event back with `get` and report its final local time. If a write outcome is uncertain, read before retrying so you never create a duplicate.
+
+## Limitations — read before acting
+
+These are hard limits, not preferences. Do not work around them by guessing, retrying blindly, or substituting another source.
+
+### Auth and hosts
+
+1. One secret only. The stored secret is the complete `Authorization` header value. There is no way to store the Apple ID and the app-specific password as two fields, no OAuth flow, and no session-cookie login. Do not ask the user for either field in chat; the secure form takes the composed header value.
+2. Two connections, same value. Discovery is answered by `caldav.icloud.com`, but the calendar collections live on the account's partition host `p<NN>-caldav.icloud.com`, so the same value must also be registered under `custom.icloud-calendar-p<NN>`. A request to the partition host without its own connection is refused (401) even though the value is correct.
+3. Hosts are fixed at first registration. A connection's hosts cannot be extended afterwards. If Apple moves the account to a different partition host, register one more connection for the new host the same way — do not edit the old one and expect it to take effect.
+4. One Apple ID per connection pair. There is no multi-account mode. A second account needs its own connection pair and its own CLI invocation.
+5. The CLI only ever handles an `hsurr:` surrogate. It never sees, logs, stores or prints the real credential. Never put a key, token, password or cookie in a doc, a helper, a command argument, an environment variable or a log.
+
+### Reads
+
+6. Nothing is cached. Every call re-runs discovery live. If Apple is unreachable, there is no last-known copy to fall back to — report the failure instead of answering from memory.
+7. Date-only `--from` / `--to` cover whole days in `ICLOUD_CALENDAR_TZ` (default Europe/Amsterdam), and `--to` is exclusive. A date-only `--to` of 2026-10-31 does not include 31 October. Full ISO datetimes with an offset are honoured as given.
+8. Floating times (no timezone in the event) are read in that same zone. An event that looks like 09:00 in another zone is still read as 09:00 in the configured zone — check the raw iCalendar from `get` when a time looks wrong.
+9. Recurrence expansion covers DAILY, WEEKLY, MONTHLY and YEARLY rules with INTERVAL, COUNT, UNTIL, BYDAY and BYMONTHDAY, plus EXDATE exclusions and RECURRENCE-ID overrides. Any other rule (for example BYSETPOS or BYWEEKNO) is returned unexpanded and flagged only by its master start. Before relying on an unusual series, read its raw iCalendar with `get` and say the expansion is unverified.
+10. `search` is a substring match over summary, location and description, inside the requested window only, and it returns at most 50 hits by default. It does not search outside the window, and it does not search attendees or attachments.
+11. `events` returns occurrences sorted by start; `--limit` truncates after sorting. A limit therefore never hides an earlier event in favour of a later one, but it can hide later ones — say so when a limit was applied.
+12. Each request times out after 30 seconds. A timeout is not proof that a write did or did not happen — read before retrying (see 16).
+
+### Writes
+
+13. `create` needs a named calendar (exact name, case-insensitive, or URL). Timed events need full ISO datetimes; all-day events need `--all-day` with dates. There is no default calendar.
+14. `update` and `delete` need the event UID, and they send the ETag back as an `If-Match` precondition. An HTTP 412 means the event changed on the server since it was read: read it again with `get` and retry. Never force the write.
+15. `create` sends `If-None-Match: *`, so creating an event whose object already exists fails instead of overwriting it.
+16. After a write, read the event back with `get` and report its final local time. If a write outcome is uncertain (timeout, unclear error), read before retrying so you never create a duplicate.
+17. This helper never sends invitations and never notifies guests. Creating an event with guests, or any change that would notify guests, needs the user's confirmation first, matching the scheduling skill.
+18. This is calendars only. Tasks, reminders, contacts, mail and files are out of scope, and there is no CalDAV scheduling (free-busy, invitations) beyond plain event objects.
+
+### Scope and proof
+
+19. When planning, only consult the user's own calendars and the shared family calendar. Ignore subscribed and system calendars unless the user names one.
+20. `status` proves only that the base credential entry exists in the store. Only `calendars` proves live access, including the partition-host connection. Prove access with a harmless read before the first write in a conversation.
+21. Operations verified live against the user's account are recorded in README.md. Anything not listed there is implemented and unit tested but untested live — label it untested, do not present it as verified.
 
 ## Limits and recovery
 
