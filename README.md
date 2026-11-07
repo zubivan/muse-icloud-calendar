@@ -14,6 +14,8 @@ remains the system of record.
 | `bin/icloud-calendar` | The CLI (single file, stdlib only). |
 | `tests/` | Offline unit tests for the parser, RRULE expansion and the CalDAV multistatus reader. |
 | `setup.html` | Offline, single-file setup helper that builds the header value in the browser. Loads and sends nothing. |
+| `AGENTS.md` | Coding agents working on this repo: layout, commands, hard rules. |
+| `CONTRIBUTING.md` | How to contribute. |
 
 Install by placing this folder at
 `~/workspace/custom-connectors/custom.icloud-calendar/`.
