@@ -5,6 +5,34 @@ directly to Apple's servers, with a self-contained iCalendar parser, no
 third-party libraries (Python standard library only), and Apple Calendar
 remains the system of record.
 
+## Connect it to your Muse
+
+You do not need to be technical. Your Muse does the fiddly parts. You
+only type things into Apple and into Muse when asked.
+
+1. Ask your Muse to install the connector from
+   github.com/zubivan/muse-icloud-calendar. It copies the files into
+   place and walks you through the rest.
+2. Make a special password just for this. Go to appleid.apple.com,
+   sign in, and open Sign-In and Security, then App-Specific
+   Passwords. Create one and name it something like "Muse Calendar".
+   This password only opens your calendars. It cannot open your mail,
+   your photos, or your account, and you can delete it any time.
+   Never type your real Apple password into this setup.
+3. Open the file `setup.html` from the connector in any browser. It
+   works even with the internet switched off, and it sends nothing
+   anywhere. Type in your Apple ID email and the special password,
+   tap the button, and copy the code it shows you.
+4. Paste that code into Muse when it asks for it, in its secure form.
+5. Ask Muse to list your calendars. If it says it needs a second
+   address too, it will show you which one. Paste the same code once
+   more when asked. Apple keeps calendars on a second address, and
+   Muse needs the same key for both.
+6. Check it works by asking Muse what is on your calendar today.
+
+The technical version of these steps, with the exact settings Muse
+registers, is under Authentication below.
+
 ## Layout
 
 | File | Who it is for |
