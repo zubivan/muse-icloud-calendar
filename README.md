@@ -16,12 +16,15 @@ Just ask your Muse to install the connector from
 github.com/zubivan/muse-icloud-calendar. Then it will walk you
 through the rest:
 
-- Making a special password just for this. Go to appleid.apple.com,
-  sign in, and open Sign-In and Security, then App-Specific
-  Passwords. Create one and name it something like "Muse Calendar".
-  This password only opens your calendars. It cannot open your mail,
-  your photos, or your account, and you can delete it any time.
-  Never type your real Apple password into this setup.
+- Making a special password just for this. First, two-factor
+  authentication must be on for your Apple Account, or Apple will
+  not offer app-specific passwords. Go to account.apple.com, sign
+  in, and open Sign-In and Security, then App-Specific Passwords.
+  Create one and name it something like "Muse Calendar". Be aware
+  this password opens your mail, contacts and calendars in iCloud,
+  not just calendars. It is still not your real Apple password, and
+  you can delete it any time at account.apple.com. Never type your
+  real Apple password into this setup.
 - Building your login code. Muse will show you the setup page right
   here in the chat. Type in your Apple ID email and the special
   password, tap the button, and copy the code it shows you. The page
@@ -29,11 +32,14 @@ through the rest:
   nothing. You can also open the file `setup.html` from the connector
   in any browser if you prefer. It is the same page.
 - Pasting that code into Muse when it asks for it, in its secure
-  form.
-- If Muse says it needs a second address too, it will show you
-  which one. Paste the same code once more when asked. Apple keeps
-  calendars on a second address, and Muse needs the same key for
-  both.
+  form. The code is only an encoded form of what you typed, so treat
+  it like a password. Paste it only into the secure form, never into
+  the chat. If it ever ends up in a chat message, delete that
+  app-specific password and make a new one.
+- Then a second address. Apple keeps calendars on a second address,
+  and Muse needs the same key for both, so this is an expected step,
+  not a problem. Muse will show you which address it is. Paste the
+  same code once more when asked.
 - At the end Muse lists your calendars and tells you when setup is
   done. Ask it what is on your calendar today to check it works.
 
@@ -89,10 +95,13 @@ declined by name (checked 2026-10-24) — so the stored secret is the
 complete `Authorization` header value. This is also the pattern public
 Muse guides document for Basic-auth services.
 
-1. At [appleid.apple.com](https://appleid.apple.com) → Sign-In and Security →
+1. At [account.apple.com](https://account.apple.com) → Sign-In and Security →
    App-Specific Passwords, generate a password for this connector.
-   Revocable there at any time, scoped to CalDAV/CardDAV only: no mail,
-   photos or account access, and never the real Apple ID password.
+   Your Apple Account must have two-factor authentication on, or Apple
+   will not offer app-specific passwords. The password is not scoped
+   to calendars. It gives access to iCloud Mail, Contacts and
+   Calendars. Revocable at account.apple.com at any time, and never
+   the real Apple Account password.
 2. Build the header value on your own device — no terminal needed.
    Muse shows you **`setup.html`** right in the chat: it is one
    self-contained file that works with the internet switched off, loads
@@ -118,9 +127,11 @@ Muse guides document for Basic-auth services.
 
 Discovery starts at `caldav.icloud.com`; the account's collections then live
 on a partition host (`p<NN>-caldav.icloud.com`). If egress to that host is
-refused, reconnect adding that single host to the registered hosts, under
-a second connection named `custom.icloud-calendar-p<NN>` holding the same
-value — the CLI derives that name from the discovered host.
+refused, register a second connection named
+`custom.icloud-calendar-p<NN>` for that host, with the same value and
+the same scheme and placement. Do not register the base connection
+again with the host added. The CLI derives the connection name from the
+discovered host.
 
 Floating times (no timezone in the event) and date-only values are read
 in `ICLOUD_CALENDAR_TZ` when set (an IANA zone name), otherwise in
@@ -162,6 +173,9 @@ throwaway event:
 ```sh
 icloud-calendar status       # base credential entry present?
 icloud-calendar calendars    # live discovery; proves both connections
+icloud-calendar create --calendar "Family" --summary "Muse test, delete me" --start 2026-11-07T12:00:00+01:00 --end 2026-11-07T12:15:00+01:00
+icloud-calendar delete --uid <event-uid>   # use the uid from the create output, then check it is gone
+icloud-calendar search --query "Muse test, delete me" --from 2026-11-07 --to 2026-11-08   # nothing found means the delete worked
 ```
 
 ## Security notes
@@ -174,6 +188,15 @@ icloud-calendar calendars    # live discovery; proves both connections
   overwriting a newer copy.
 - Nothing here logs, stores or prints credential material. Surrogates are
   the only credential-shaped values the process ever sees.
+
+## Disconnect
+
+To stop the connector, remove both connections in Muse
+(`custom.icloud-calendar` and `custom.icloud-calendar-p<NN>`) and
+revoke the app-specific password at account.apple.com → Sign-In and
+Security → App-Specific Passwords. Changing or resetting your Apple
+Account password revokes all app-specific passwords automatically,
+which breaks the connector until you make a new one.
 
 ## License
 

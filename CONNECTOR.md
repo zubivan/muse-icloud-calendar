@@ -8,7 +8,7 @@
 
 ## Connect
 
-- The connection is registered with `credentials.request_api_access`. Reuse these exact details for a reconnect because the scheme and placement cannot change afterwards:
+- The connection is registered with `credentials.request_api_access`. Reuse these exact details if you register the connection again, because the scheme and placement cannot change afterwards:
 
 ```json
 {
@@ -19,10 +19,12 @@
 }
 ```
 
-- Guide the user through setup one step at a time. Do not paste the whole procedure at once. Tell them to make an app-specific password at appleid.apple.com, then show them the setup page inline in the chat with `widget.create_html_file_widget` on `setup.html` so they can build the header value on their own device, then to paste that value into the secure form when it appears. Verify with `calendars` at the end and say when setup is done.
+- Guide the user through setup one step at a time. Do not paste the whole procedure at once. First tell them to make an app-specific password at account.apple.com. Then show them the setup page inline in the chat with `widget.create_html_file_widget` on `setup.html` so they can build the header value on their own device. Then register the base connection for `caldav.icloud.com` with that value through the secure form. Then run `calendars` and read the partition host from discovery. Then ask the user to paste the same value once more into the secure form for the second connection `custom.icloud-calendar-p<NN>`. Then run `calendars` again and tell the user setup is done.
+- The Apple Account must have two-factor authentication on. App-Specific Passwords is not available without it.
 - CalDAV only offers HTTP Basic auth, and Muse's connector registration deposits exactly one secret. The `multi_secret` and `password` schemes were both tried on 2026-10-24 and declined by name. So the one stored secret is the complete Authorization header value, which the user builds on their own machine from their Apple ID email and an app-specific password, as README.md describes. Two-field storage with username and password kept separately is not supported by the registration today. If that changes, the CLI's `authorization_value` is the one place that changes.
-- The user generates the app-specific password at appleid.apple.com and can revoke it there at any time. Its scope is CalDAV and CardDAV only.
-- The same value must be registered twice. Register it once for `caldav.icloud.com` under the connection `custom.icloud-calendar`, and once for the account's partition host under the connection `custom.icloud-calendar-p<NN>`. For a host such as `p45-caldav.icloud.com` the connection is `custom.icloud-calendar-p45`. Discovery is answered by `caldav.icloud.com` itself, but the calendar collections live on `p<NN>-caldav.icloud.com`, and Muse swaps the credential only toward a host registered on the connection used for that request. A connection's hosts are fixed at first registration. Reconnecting with extra hosts did not take effect. This was verified live on 2026-10-24, when discovery answered 207, every direct partition-host request answered 401, and an anonymous control request also answered 401, so the credential itself is valid. The partition host shows in the calendar-home URL during discovery. The CLI picks the connection by request host. If Apple ever moves the account to a different partition host, register one more connection for it the same way.
+- The user generates the app-specific password at account.apple.com and can revoke it there at any time. It is not scoped to calendars. It gives access to iCloud Mail, Contacts and Calendars. It is not the real Apple Account password.
+- The built value is only base64-encoded, so treat it as a password. Paste it only into the secure form, never into the chat. If the user pastes the value or the password into the chat, do not use it. Ask them to revoke that app-specific password and start again.
+- The same value must be registered twice. Register it once for `caldav.icloud.com` under the connection `custom.icloud-calendar`, and once for the account's partition host under the connection `custom.icloud-calendar-p<NN>`. For a host such as `p45-caldav.icloud.com` the connection is `custom.icloud-calendar-p45`. Discovery is answered by `caldav.icloud.com` itself, but the calendar collections live on `p<NN>-caldav.icloud.com`, and Muse swaps the credential only toward a host registered on the connection used for that request. A connection's hosts are fixed at first registration. Adding hosts to an existing connection did not take effect. This was verified live on 2026-10-24, when discovery answered 207, every direct partition-host request answered 401, and an anonymous control request also answered 401, so the credential itself is valid. The partition host shows in the calendar-home URL during discovery. The CLI picks the connection by request host. If Apple ever moves the account to a different partition host, register one more connection for it the same way.
 - Live verification record, 2026-10-24: `calendars` returned the account's 7 calendars, and `events` on the shared calendar returned real events with recurrence expansion and the October DST change handled correctly, so reads are verified end to end. The first live REPORT exposed a bug in the connector, since fixed: the calendar-query body declared two default namespaces, which Apple rejects with HTTP 400, and the query elements are now properly prefixed. Update was exercised live later the same day by retiming an existing entry and is verified with read-back. It exposed two more bugs, both fixed: iCloud answers some UID text-match REPORTs with 412, so fetch_by_uid now falls back to a direct GET of `<uid>.ics`, and a timed value for an all-day event was silently truncated to dates, so it now converts the event to timed. A full CRUD test followed on 2026-10-24 at the user's request, on a throwaway event on the shared calendar: create, read, update with the ETag rolling, delete, and post-delete read and search confirming removal. All passed. Every operation is now verified live.
 - Prove access with a harmless read before the first write in a conversation:
 
@@ -30,7 +32,7 @@
 ~/workspace/custom-connectors/custom.icloud-calendar/bin/icloud-calendar calendars
 ```
 
-- Discovery starts at caldav.icloud.com and the account's calendars then live on one partition host named like p45-caldav.icloud.com. If a live read fails because egress to that host is refused, reconnect with the same details plus that one partition host added to `api_hosts`. The partition host is visible in the redirect the helper reports.
+- Discovery starts at caldav.icloud.com and the account's calendars then live on one partition host named like p45-caldav.icloud.com. If a live read fails because egress to that host is refused, register a second connection named `custom.icloud-calendar-p<NN>` for that host, with the same value and the same scheme and placement. Do not register the base connection again with the host added. The partition host is visible in the redirect the helper reports.
 
 ## Credentials
 
@@ -74,7 +76,7 @@ icloud-calendar delete --uid <event-uid>
 
 ## Recover from errors
 
-- A 401 on a request that carried the surrogate means the app-specific password was revoked or replaced. Ask the user to generate a fresh one and reconnect with the details above. A 401 on a request without the surrogate says nothing about the credential, so check the helper attached it before reconnecting.
+- A 401 on a request that carried the surrogate does not by itself mean the password was revoked. Check which host answered 401 first. On a `p<NN>` host with no matching connection, register that connection with the same value and the same scheme and placement. Only on `caldav.icloud.com`, or with both connections present, treat it as a revoked or replaced password. Ask the user to generate a fresh one and register the fresh value on both connections. A 401 on a request without the surrogate says nothing about the credential, so check the helper attached it before registering the value again.
 - Apple publishes no rate limits for CalDAV. Do not retry a 429 in a tight loop. Back off and report it.
 - After a failed or timed-out change, check the current state with a read before trying again, because the first request may have completed.
 - The `status` command only proves the base credential entry exists in the store. Only the `calendars` command proves live access, including the partition-host connection.
