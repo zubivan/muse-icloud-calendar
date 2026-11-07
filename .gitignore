@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+# Credentials live in the Muse credentials store, never in this repo.
+# Anything that looks like a local credential or config file stays out.
+*.local.*
+credentials*
+*secret*
+.env

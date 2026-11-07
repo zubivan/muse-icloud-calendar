@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>iCloud Calendar connector — setup helper</title>
+<!--
+  This page is a single self-contained file. It loads nothing from the
+  network, stores nothing, and sends nothing anywhere: the value below is
+  computed in your browser, on this device, when you tap the button.
+  You can disconnect from the internet before using it, and you can read
+  every line of it — it is about 200 lines in total.
+-->
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: system-ui, -apple-system, sans-serif; margin: 0;
+         padding: 24px 16px 48px; line-height: 1.5; }
+  main { max-width: 560px; margin: 0 auto; }
+  h1 { font-size: 22px; margin: 0 0 8px; }
+  p.sub { margin: 0 0 24px; opacity: .75; }
+  label { display: block; font-weight: 600; margin: 18px 0 6px; }
+  input, textarea { width: 100%; box-sizing: border-box; font-size: 17px;
+    padding: 12px; border-radius: 10px; border: 1px solid #8886;
+    background: transparent; color: inherit; }
+  textarea { font-family: ui-monospace, monospace; font-size: 13px;
+    word-break: break-all; }
+  button { width: 100%; margin-top: 18px; padding: 14px; font-size: 17px;
+    font-weight: 600; border: 0; border-radius: 12px; cursor: pointer;
+    background: #0a6cff; color: #fff; }
+  button.secondary { background: transparent; color: inherit;
+    border: 1px solid #8886; }
+  .hidden { display: none; }
+  .note { font-size: 14px; opacity: .8; margin-top: 10px; }
+  ol { padding-left: 20px; }
+  li { margin: 6px 0; }
+  .ok { font-weight: 600; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Connect iCloud Calendar</h1>
+  <p class="sub">This page builds the one value Muse's secure form asks
+  for. Nothing you type here leaves this device.</p>
+
+  <ol>
+    <li>On <strong>appleid.apple.com</strong>, sign in and open
+      <strong>Sign-In and Security → App-Specific Passwords</strong>.</li>
+    <li>Generate a password and name it for this connector, for example
+      “Muse iCloud Calendar”. Apple shows it once, in groups like
+      <em>xxxx-xxxx-xxxx-xxxx</em>.</li>
+    <li>Type your Apple ID email and that app-specific password below,
+      then tap <strong>Build my value</strong>.</li>
+    <li>Copy the result and paste it into Muse's secure form as the key.
+      Then close this page.</li>
+  </ol>
+
+  <label for="email">Apple ID email</label>
+  <input id="email" type="email" autocomplete="off" autocapitalize="none"
+         placeholder="you@icloud.com">
+
+  <label for="password">App-specific password</label>
+  <input id="password" type="password" autocomplete="off"
+         placeholder="xxxx-xxxx-xxxx-xxxx">
+  <p class="note">Use the app-specific password from step 2, never your
+  real Apple ID password. Spaces are removed automatically.</p>
+
+  <button id="build" type="button">Build my value</button>
+
+  <div id="result" class="hidden">
+    <label for="value">Your value — paste this into Muse's secure form</label>
+    <textarea id="value" rows="4" readonly></textarea>
+    <button id="copy" type="button">Copy</button>
+    <p class="note ok" id="copied"></p>
+    <button id="clear" type="button" class="secondary">Clear everything</button>
+  </div>
+
+  <p class="note">How to be sure this is safe: the page is one file, it
+  works with the internet switched off, it has no accounts, no analytics
+  and no storage, and its full source is short enough to read. The value
+  it builds is only an encoded form of what you typed — treat it like a
+  password, because anyone who has it can use it until you revoke the
+  app-specific password at appleid.apple.com.</p>
+</main>
+
+<script>
+"use strict";
+var emailEl = document.getElementById("email");
+var passwordEl = document.getElementById("password");
+var resultEl = document.getElementById("result");
+var valueEl = document.getElementById("value");
+var copiedEl = document.getElementById("copied");
+
+function toBase64(text) {
+  var bytes = new TextEncoder().encode(text);
+  var binary = "";
+  for (var i = 0; i < bytes.length; i++) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  return btoa(binary);
+}
+
+document.getElementById("build").addEventListener("click", function () {
+  var email = emailEl.value.trim();
+  var password = passwordEl.value.replace(/\s+/g, "");
+  if (!email || !password) {
+    copiedEl.textContent = "Fill in both fields first.";
+    resultEl.classList.remove("hidden");
+    valueEl.value = "";
+    return;
+  }
+  // Same composition as authorization_value() in bin/icloud-calendar.
+  valueEl.value = "Basic " + toBase64(email + ":" + password);
+  copiedEl.textContent = "";
+  resultEl.classList.remove("hidden");
+  valueEl.focus();
+  valueEl.select();
+});
+
+document.getElementById("copy").addEventListener("click", function () {
+  valueEl.select();
+  function done() { copiedEl.textContent = "Copied. Paste it into Muse's secure form, then close this page."; }
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(valueEl.value).then(done, function () {
+      document.execCommand("copy"); done();
+    });
+  } else {
+    document.execCommand("copy"); done();
+  }
+});
+
+document.getElementById("clear").addEventListener("click", function () {
+  emailEl.value = "";
+  passwordEl.value = "";
+  valueEl.value = "";
+  copiedEl.textContent = "";
+  resultEl.classList.add("hidden");
+});
+</script>
+</body>
+</html>

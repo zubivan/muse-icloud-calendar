@@ -1,0 +1,7 @@
+id: custom.icloud-calendar
+title: custom.icloud-calendar
+description: 'iCloud Calendar over CalDAV using the custom.icloud-calendar connector: list calendars, read and search events with recurrence expansion, and create, update or delete events on the user''s Apple calendars. Apple Calendar stays the system of record. Use when the user asks about their Apple or iCloud calendar rather than Google or Outlook.'
+include_in_prompt: true
+require_auth: false
+availability:
+  confidential_vm: false

@@ -1,0 +1,1049 @@
+#!/usr/bin/env python3
+"""icloud-calendar: iCloud Calendar via CalDAV, as a Muse custom connector.
+
+Direct CalDAV against Apple's servers, own iCalendar parser, no
+third-party libraries (stdlib only).
+
+Auth: the credential lives in Muse's credentials store as the registered
+connection `custom.icloud-calendar`. This CLI only ever handles an
+`hsurr:` surrogate returned by dynamic_credentials.py. Muse swaps the
+surrogate for the real credential on egress, and only toward a registered
+host.
+
+CalDAV needs HTTP Basic auth, and Muse's connector registration deposits
+exactly one secret (multi-secret and password schemes are declined by
+name, checked 2026-10-24). So the single stored secret is the complete
+Authorization header value, registered with placement
+`custom_header:Authorization`: `Basic <base64(Apple ID + ":" +
+app-specific password)>`, built by the user on their own machine (see
+authorization_value and README.md). Two-field (username + password)
+storage is not supported by Muse's connector registration today, so
+the header form is the working design. If the store later accepts a
+username plus password pair, this is the one place that changes.
+
+Commands print JSON to stdout. Times are ISO 8601. Event writes go through
+CalDAV PUT/DELETE with ETag preconditions, so a stale write fails instead of
+silently overwriting a newer copy.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import os
+import json
+import re
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
+import xml.etree.ElementTree as ET
+from datetime import date, datetime, time, timedelta, timezone
+from zoneinfo import ZoneInfo
+
+sys.path.insert(0, "/opt/muse/skills/custom-connector-setup/bin")
+from dynamic_credentials import (  # noqa: E402
+    DynamicCredentialError,
+    add_surrogate_to_request,
+    dynamic_credential_entry,
+    read_response_body,
+)
+
+CREDENTIAL = "custom.icloud-calendar"
+# The same value is registered a second time for the account's partition
+# host: a connection's registered hosts are fixed at first registration,
+# and Muse swaps the credential only toward a registered host, so
+# partition-host requests need their own connection. See CONNECTOR.md.
+# The partition host is per-account (p<NN>-caldav.icloud.com) and only
+# learned from discovery, so its connection name is derived from it:
+# p45-caldav.icloud.com -> custom.icloud-calendar-p45.
+ENTRY = "access_token"  # holds the Authorization header value (see docstring)
+
+
+def partition_credential(host):
+    """Connection name holding the same value for a partition host."""
+    return f"{CREDENTIAL}-{host.split('-')[0]}"
+
+
+# Floating times (no TZID, no Z) and date-only values are read in this
+# zone. Defaults to Europe/Amsterdam; override with ICLOUD_CALENDAR_TZ
+# (an IANA zone name) for another home zone.
+DEFAULT_TZ_NAME = os.environ.get("ICLOUD_CALENDAR_TZ", "Europe/Amsterdam")
+
+
+def _local_tz():
+    return ZoneInfo(DEFAULT_TZ_NAME)
+
+
+BASE_HOST = "caldav.icloud.com"
+BASE_URL = f"https://{BASE_HOST}"
+# iCloud answers discovery on caldav.icloud.com, then calendar collections
+# live on a per-account partition host p<NN>-caldav.icloud.com. The partition
+# number is account-specific and only learned from discovery, so the allow
+# list is generated. Egress itself stays gated by the hosts registered with
+# the credential, which CONNECTOR.md covers.
+ALLOWED_HOSTS = [BASE_HOST] + [f"p{n}-caldav.icloud.com" for n in range(1, 300)]
+PARTITION_HOST = re.compile(r"^p\d+-caldav\.icloud\.com$")
+
+DAV = "DAV:"
+CALDAV = "urn:ietf:params:xml:ns:caldav"
+ET.register_namespace("d", DAV)
+ET.register_namespace("c", CALDAV)
+
+
+class CalDavError(RuntimeError):
+    def __init__(self, message, status=None):
+        super().__init__(message)
+        self.status = status
+
+
+def authorization_value(username, password):
+    """The HTTP Basic header value for a CalDAV request.
+
+    Pure and unit tested. The user runs this composition on their own
+    machine at setup time and stores the result as the connector's one
+    secret. Inside this sandbox only the surrogate of that stored value
+    is ever seen, so nothing here composes real credentials.
+    """
+    raw = f"{username}:{password}".encode("utf-8")
+    return "Basic " + base64.b64encode(raw).decode("ascii")
+
+
+# --------------------------------------------------------------------------
+# HTTP layer: surrogate auth, no automatic redirects (guide rule). Redirects
+# are followed manually, only to iCloud CalDAV hosts, re-issuing the request
+# so the surrogate travels with it and Muse can swap it on each egress.
+# --------------------------------------------------------------------------
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None  # surfaces as HTTPError with the Location header
+
+
+_OPENER = urllib.request.build_opener(_NoRedirect())
+
+
+def request(method, url, body=None, content_type=None, extra_headers=None,
+            allow_statuses=()):
+    """One authenticated CalDAV request. Returns (status, headers, bytes)."""
+    if isinstance(body, str):
+        body = body.encode("utf-8")
+    current_url = url
+    for _ in range(4):
+        req = urllib.request.Request(current_url, data=body, method=method)
+        req.add_header("User-Agent", "muse-icloud-calendar/1.0")
+        if content_type:
+            req.add_header("Content-Type", content_type)
+        for key, value in (extra_headers or {}).items():
+            req.add_header(key, value)
+        host = urllib.parse.urlparse(current_url).hostname or ""
+        credential = (partition_credential(host)
+                      if PARTITION_HOST.match(host) else CREDENTIAL)
+        add_surrogate_to_request(req, credential, entry_name=ENTRY,
+                                 allowed_hosts=ALLOWED_HOSTS)
+        try:
+            with _OPENER.open(req, timeout=30) as resp:
+                return resp.status, resp.headers, read_response_body(resp)
+        except urllib.error.HTTPError as e:
+            raw = read_response_body(e)
+            if e.code in (301, 302, 307, 308):
+                location = e.headers.get("Location")
+                if not location:
+                    raise CalDavError("redirect without Location", e.code)
+                target = urllib.parse.urljoin(current_url, location)
+                host = urllib.parse.urlparse(target).hostname or ""
+                if host != BASE_HOST and not PARTITION_HOST.match(host):
+                    raise CalDavError(f"refusing redirect to {host}", e.code)
+                current_url = target
+                continue
+            if e.code in allow_statuses:
+                return e.code, e.headers, raw
+            text = raw.decode("utf-8", "replace")[:300]
+            raise CalDavError(f"{method} {current_url} -> HTTP {e.code}: {text}",
+                              e.code)
+        except urllib.error.URLError as e:
+            raise CalDavError(f"{method} {current_url} failed: {e.reason}")
+    raise CalDavError("too many redirects")
+
+
+def propfind(url, body_xml, depth):
+    status, _, raw = request("PROPFIND", url, body_xml,
+                             "application/xml; charset=utf-8",
+                             {"Depth": str(depth)})
+    if status not in (200, 207):
+        raise CalDavError(f"PROPFIND {url} -> HTTP {status}", status)
+    return ET.fromstring(raw)
+
+
+def q(tag, ns=DAV):
+    return f"{{{ns}}}{tag}"
+
+
+# --------------------------------------------------------------------------
+# Discovery: current-user-principal -> calendar-home-set -> collections.
+# --------------------------------------------------------------------------
+
+def discover():
+    root = propfind(
+        BASE_URL + "/",
+        '<propfind xmlns="DAV:"><prop><current-user-principal/></prop></propfind>',
+        0)
+    href = root.find(f".//{q('current-user-principal')}/{q('href')}")
+    if href is None or not href.text:
+        raise CalDavError("discovery: no current-user-principal in response")
+    principal = urllib.parse.urljoin(BASE_URL + "/", href.text)
+
+    root = propfind(
+        principal,
+        '<propfind xmlns="DAV:">'
+        '<prop><calendar-home-set xmlns="urn:ietf:params:xml:ns:caldav"/></prop>'
+        '</propfind>',
+        0)
+    home = root.find(f".//{q('calendar-home-set', CALDAV)}/{q('href')}")
+    if home is None or not home.text:
+        raise CalDavError("discovery: no calendar-home-set in response")
+    home_url = urllib.parse.urljoin(principal, home.text)
+    # The collections live on the account's partition host (ALLOWED_HOSTS
+    # already covers the whole p<NN> range). The partition host must also
+    # be in the connection's registered hosts, or Muse will not swap the
+    # surrogate for it on egress and Apple answers 401.
+    return principal, home_url
+
+
+def list_calendars():
+    _, home_url = discover()
+    root = propfind(
+        home_url,
+        '<propfind xmlns="DAV:">'
+        '<prop><displayname/><resourcetype/>'
+        '<calendar-color xmlns="http://apple.com/ns/ical/"/>'
+        '<current-user-privilege-set/></prop></propfind>',
+        1)
+    out = []
+    for resp in root.iter(q("response")):
+        rtype = resp.find(f".//{q('resourcetype')}")
+        if rtype is None or rtype.find(q("calendar", CALDAV)) is None:
+            continue
+        href = resp.find(q("href")).text
+        name_el = resp.find(f".//{q('displayname')}")
+        color_el = resp.find(
+            f".//{{http://apple.com/ns/ical/}}calendar-color")
+        out.append({
+            "name": name_el.text if name_el is not None else "",
+            "url": urllib.parse.urljoin(home_url, href),
+            "href": href,
+            "color": color_el.text if color_el is not None else None,
+        })
+    out.sort(key=lambda c: (c["name"] or "").lower())
+    return out
+
+
+def resolve_calendar(calendars, selector):
+    """Match a calendar by exact name, case-insensitive name, or URL."""
+    if not selector:
+        return None
+    for cal in calendars:
+        if selector in (cal["name"], cal["url"], cal["href"]):
+            return cal
+    lowered = selector.lower()
+    for cal in calendars:
+        if (cal["name"] or "").lower() == lowered:
+            return cal
+    raise CalDavError(f"no calendar matches {selector!r}")
+
+
+# --------------------------------------------------------------------------
+# iCalendar: unfolding parser, serializer, RRULE expansion. Self-contained
+# on purpose: nothing here trusts a third-party parser with calendar data.
+# --------------------------------------------------------------------------
+
+def unfold(text):
+    lines = []
+    for raw in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        if raw[:1] in (" ", "\t") and lines:
+            lines[-1] += raw[1:]
+        elif raw:
+            lines.append(raw)
+    return lines
+
+
+def split_prop(line):
+    """'DTSTART;TZID=Europe/Amsterdam:20261024T090000' -> (name, params, value)."""
+    head, _, value = line.partition(":")
+    parts = head.split(";")
+    params = {}
+    for part in parts[1:]:
+        key, _, val = part.partition("=")
+        params[key.upper()] = val.strip('"')
+    return parts[0].upper(), params, value
+
+
+def unescape_text(value):
+    return (value.replace("\\n", "\n").replace("\\N", "\n")
+            .replace("\\,", ",").replace("\\;", ";").replace("\\\\", "\\"))
+
+
+def escape_text(value):
+    return (value.replace("\\", "\\\\").replace("\n", "\\n")
+            .replace(",", "\\,").replace(";", "\\;"))
+
+
+def parse_dt(value, params):
+    """Return (datetime-or-date, is_date). TZID honoured, 'Z' is UTC,
+    floating times are read in the local zone of the value's calendar."""
+    value = value.strip()
+    if re.fullmatch(r"\d{8}", value):
+        return date(int(value[0:4]), int(value[4:6]), int(value[6:8])), True
+    m = re.fullmatch(r"(\d{8})T(\d{6})(Z?)", value)
+    if not m:
+        raise CalDavError(f"unparseable iCalendar datetime: {value!r}")
+    naive = datetime.strptime(m.group(1) + m.group(2), "%Y%m%d%H%M%S")
+    if m.group(3) == "Z":
+        return naive.replace(tzinfo=timezone.utc), False
+    tzid = params.get("TZID")
+    if tzid:
+        return naive.replace(tzinfo=ZoneInfo(tzid)), False
+    return naive.replace(tzinfo=_local_tz()), False
+
+
+def format_dt(value):
+    """datetime -> (value, params, is_date) for serialization."""
+    if isinstance(value, date) and not isinstance(value, datetime):
+        return value.strftime("%Y%m%d"), {}, True
+    if value.tzinfo is not None and value.utcoffset() == timedelta(0):
+        return value.strftime("%Y%m%dT%H%M%SZ"), {}, False
+    tzid = getattr(value.tzinfo, "key", None)
+    if tzid:
+        return value.strftime("%Y%m%dT%H%M%S"), {"TZID": tzid}, False
+    return value.strftime("%Y%m%dT%H%M%S"), {}, False
+
+
+class VEvent:
+    def __init__(self, props):
+        self.props = props  # list of (name, params, raw_value)
+
+    def get(self, name):
+        for n, params, value in self.props:
+            if n == name:
+                return params, value
+        return None, None
+
+    def get_text(self, name):
+        _, value = self.get(name)
+        return unescape_text(value) if value is not None else None
+
+    @property
+    def uid(self):
+        return self.get_text("UID")
+
+    @property
+    def summary(self):
+        return self.get_text("SUMMARY")
+
+    def start(self):
+        params, value = self.get("DTSTART")
+        if value is None:
+            return None, True
+        return parse_dt(value, params)
+
+    def end(self, start=None, start_is_date=True):
+        params, value = self.get("DTEND")
+        if value is not None:
+            return parse_dt(value, params)
+        _, dur = self.get("DURATION")
+        if dur and start is not None:
+            m = re.fullmatch(r"P(?:(\d+)W)?(?:(\d+)D)?"
+                             r"(?:T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?)?", dur)
+            if m:
+                weeks, days, hh, mm, ss = (int(x or 0) for x in m.groups())
+                delta = timedelta(weeks=weeks, days=days, hours=hh,
+                                  minutes=mm, seconds=ss)
+                if start_is_date and not isinstance(start, datetime):
+                    return start + delta, True
+                return start + delta, False
+        if start_is_date and not isinstance(start, datetime):
+            return start + timedelta(days=1), True  # all-day default
+        return start, start_is_date
+
+
+def parse_ical(text):
+    """Parse calendar-data into (vevents, raw_text)."""
+    events = []
+    current = None
+    for line in unfold(text):
+        name, params, value = split_prop(line)
+        if name == "BEGIN" and value.upper() == "VEVENT":
+            current = []
+        elif name == "END" and value.upper() == "VEVENT" and current is not None:
+            events.append(VEvent(current))
+            current = None
+        elif current is not None:
+            current.append((name, params, value))
+    return events
+
+
+def build_ical(uid, summary, start, end, all_day=False, location=None,
+               description=None, rrule=None):
+    lines = ["BEGIN:VCALENDAR", "VERSION:2.0",
+             "PRODID:-//Muse//iCloud Calendar Connector//EN",
+             "BEGIN:VEVENT", f"UID:{uid}"]
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    lines.append(f"DTSTAMP:{stamp}")
+    if all_day:
+        if isinstance(start, datetime):
+            start = start.date()
+        if isinstance(end, datetime):
+            end = end.date()
+        lines.append(f"DTSTART;VALUE=DATE:{start.strftime('%Y%m%d')}")
+        lines.append(f"DTEND;VALUE=DATE:{end.strftime('%Y%m%d')}")
+    else:
+        for label, value in (("DTSTART", start), ("DTEND", end)):
+            rendered, params, _ = format_dt(value)
+            param_str = "".join(f";{k}={v}" for k, v in params.items())
+            lines.append(f"{label}{param_str}:{rendered}")
+    lines.append(f"SUMMARY:{escape_text(summary)}")
+    if location:
+        lines.append(f"LOCATION:{escape_text(location)}")
+    if description:
+        lines.append(f"DESCRIPTION:{escape_text(description)}")
+    if rrule:
+        lines.append(f"RRULE:{rrule}")
+    lines += ["END:VEVENT", "END:VCALENDAR"]
+    folded = []
+    for line in lines:  # fold at 73 octets, RFC 5545 style
+        data = line.encode("utf-8")
+        while len(data) > 73:
+            folded.append(data[:73].decode("utf-8", "ignore"))
+            data = b" " + data[73:]
+        folded.append(data.decode("utf-8", "ignore"))
+    return "\r\n".join(folded) + "\r\n"
+
+
+# --- RRULE expansion -------------------------------------------------------
+_WEEKDAYS = {"MO": 0, "TU": 1, "WE": 2, "TH": 3, "FR": 4, "SA": 5, "SU": 6}
+
+
+def _rrule_parts(rrule):
+    parts = {}
+    for chunk in rrule.split(";"):
+        key, _, val = chunk.partition("=")
+        parts[key.upper()] = val
+    return parts
+
+
+def expand_event(ev, window_start, window_end):
+    """Occurrences of one VEVENT inside [window_start, window_end).
+
+    Returns a list of dicts. Non-recurring events yield at most one entry.
+    Times compare as instants; all-day events compare as dates.
+    RECURRENCE-ID override handling: an override replaces the master
+    occurrence at its original start.
+    """
+    start, start_is_date = ev.start()
+    if start is None:
+        return []
+    end, _ = ev.end(start, start_is_date)
+    _, rrule_raw = ev.get("RRULE")
+    _, recur_id_raw = ev.get("RECURRENCE-ID")
+    if recur_id_raw is not None:
+        return []  # overrides are emitted through their master
+    exdates = set()
+    for name, params, value in ev.props:
+        if name == "EXDATE":
+            for piece in value.split(","):
+                parsed, _ = parse_dt(piece, params)
+                exdates.add(_as_instant(parsed))
+
+    starts = [start]
+    if rrule_raw:
+        starts = _expand_rrule(start, _rrule_parts(rrule_raw), window_end)
+
+    duration = None
+    if not start_is_date and isinstance(start, datetime):
+        duration = end - start if isinstance(end, datetime) else timedelta(0)
+
+    out = []
+    for occ_start in starts:
+        if _as_instant(occ_start) in exdates:
+            continue
+        occ_end = (occ_start + duration if duration is not None
+                   else occ_start + (end - start))
+        if _as_instant(occ_end) <= _as_instant(window_start):
+            continue
+        if _as_instant(occ_start) >= _as_instant(window_end):
+            continue
+        out.append({"start": occ_start, "end": occ_end,
+                    "recurring": bool(rrule_raw)})
+    return out
+
+
+def _as_instant(value):
+    if isinstance(value, datetime):
+        return value.timestamp()
+    return datetime.combine(value, time.min,
+                            tzinfo=_local_tz()).timestamp()
+
+
+def _expand_rrule(start, parts, window_end):
+    freq = parts.get("FREQ", "")
+    interval = int(parts.get("INTERVAL", "1"))
+    count = int(parts["COUNT"]) if "COUNT" in parts else None
+    until = None
+    if "UNTIL" in parts:
+        until, until_is_date = parse_dt(parts["UNTIL"], {})
+        if until_is_date:
+            until = datetime.combine(until, time.max,
+                                     tzinfo=_local_tz())
+    results = []
+
+    def push(candidate):
+        if until is not None and _as_instant(candidate) > _as_instant(until):
+            return False
+        results.append(candidate)
+        return count is None or len(results) < count
+
+    if freq == "DAILY":
+        cur = start
+        while _as_instant(cur) < _as_instant(window_end):
+            if not push(cur):
+                break
+            cur = cur + timedelta(days=interval)
+    elif freq == "WEEKLY":
+        byday = parts.get("BYDAY")
+        days = sorted(_WEEKDAYS[d[-2:]] for d in byday.split(",")) \
+            if byday else [start.weekday()]
+        week_start = start - timedelta(days=start.weekday())
+        first = True
+        cur_week = week_start
+        while _as_instant(cur_week) < _as_instant(window_end):
+            for day in days:
+                candidate = cur_week + timedelta(days=day)
+                if isinstance(start, datetime):
+                    candidate = candidate.replace(
+                        hour=start.hour, minute=start.minute,
+                        second=start.second, tzinfo=start.tzinfo)
+                if _as_instant(candidate) < _as_instant(start):
+                    continue
+                if _as_instant(candidate) >= _as_instant(window_end) and not first:
+                    pass
+                if not push(candidate):
+                    return results
+            first = False
+            cur_week += timedelta(weeks=interval)
+            if count is not None and len(results) >= count:
+                break
+            if _as_instant(cur_week) > _as_instant(window_end) \
+                    and (count is None or len(results) >= count):
+                break
+            if len(results) > 2000:
+                break
+    elif freq == "MONTHLY":
+        byday = parts.get("BYDAY")
+        bymonthday = parts.get("BYMONTHDAY")
+        year, month = start.year, start.month
+        for _ in range(1200):
+            if byday:
+                candidate = _nth_weekday(year, month, byday, start)
+            else:
+                wanted = int(bymonthday.split(",")[0]) if bymonthday \
+                    else start.day
+                if wanted < 0:
+                    wanted = _days_in_month(year, month) + wanted + 1
+                day = min(wanted, _days_in_month(year, month))
+                candidate = start.replace(year=year, month=month, day=day)
+            if candidate is not None \
+                    and _as_instant(candidate) >= _as_instant(start):
+                if count is None and until is None \
+                        and _as_instant(candidate) >= _as_instant(window_end):
+                    break
+                if not push(candidate):
+                    break
+                if count is not None and len(results) >= count:
+                    break
+            month += interval
+            year += (month - 1) // 12
+            month = (month - 1) % 12 + 1
+    elif freq == "YEARLY":
+        cur = start
+        while _as_instant(cur) < _as_instant(window_end):
+            if not push(cur):
+                break
+            try:
+                cur = cur.replace(year=cur.year + interval)
+            except ValueError:  # 29 Feb -> skip that year
+                cur = cur.replace(year=cur.year + interval, day=28)
+    else:
+        return [start]
+    return [s for s in results if _as_instant(s) >= _as_instant(start)]
+
+
+def _days_in_month(year, month):
+    if month == 12:
+        return 31
+    return (date(year, month + 1, 1) - date(year, month, 1)).days
+
+
+def _nth_weekday(year, month, byday, like):
+    """'2TU' or '-1FR' style BYDAY for MONTHLY rules."""
+    m = re.fullmatch(r"(-?\d)([A-Z]{2})", byday.split(",")[0])
+    if not m:
+        return None
+    n, weekday = int(m.group(1)), _WEEKDAYS[m.group(2)]
+    matches = [d for d in range(1, _days_in_month(year, month) + 1)
+               if date(year, month, d).weekday() == weekday]
+    if not matches:
+        return None
+    day = matches[n - 1] if n > 0 else matches[n]
+    base = date(year, month, day)
+    if isinstance(like, datetime):
+        return datetime.combine(base, like.timetz())
+    return base
+
+
+# --------------------------------------------------------------------------
+# CalDAV queries
+# --------------------------------------------------------------------------
+
+def _report_events(cal_url, window_start, window_end, extra_filter=""):
+    start_s = window_start.strftime("%Y%m%dT%H%M%SZ")
+    end_s = window_end.strftime("%Y%m%dT%H%M%SZ")
+    body = (
+        '<c:calendar-query xmlns:c="urn:ietf:params:xml:ns:caldav" '
+        'xmlns:d="DAV:">'
+        '<d:prop><d:getetag/><c:calendar-data/></d:prop>'
+        '<c:filter><c:comp-filter name="VCALENDAR">'
+        '<c:comp-filter name="VEVENT">'
+        f'<c:time-range start="{start_s}" end="{end_s}"/>'
+        f'{extra_filter}'
+        '</c:comp-filter></c:comp-filter></c:filter></c:calendar-query>')
+    status, _, raw = request("REPORT", cal_url, body,
+                             "application/xml; charset=utf-8", {"Depth": "1"})
+    if status not in (200, 207):
+        raise CalDavError(f"REPORT {cal_url} -> HTTP {status}", status)
+    return _parse_multistatus(raw)
+
+
+def _parse_multistatus(raw):
+    root = ET.fromstring(raw)
+    items = []
+    for resp in root.iter(q("response")):
+        href_el = resp.find(q("href"))
+        etag_el = resp.find(f".//{q('getetag')}")
+        data_el = resp.find(f".//{q('calendar-data', CALDAV)}")
+        if href_el is None or data_el is None or not data_el.text:
+            continue
+        items.append({
+            "href": href_el.text,
+            "etag": etag_el.text.strip('"') if etag_el is not None else None,
+            "ical": data_el.text,
+        })
+    return items
+
+
+def collect_events(calendars, window_start, window_end, limit=None):
+    """Expanded occurrences across the given calendars, sorted by start."""
+    out = []
+    for cal in calendars:
+        for item in _report_events(cal["url"], window_start, window_end):
+            for ev in parse_ical(item["ical"]):
+                overrides = _overrides(item["ical"])
+                for occ in expand_event(ev, window_start, window_end):
+                    start = occ["start"]
+                    override = overrides.get((ev.uid, _as_instant(start)))
+                    shown = override if override else ev
+                    if override:
+                        o_start, _ = override.start()
+                        o_end, _ = override.end(o_start)
+                        occ = {"start": o_start, "end": o_end,
+                               "recurring": True}
+                    out.append({
+                        "uid": ev.uid,
+                        "summary": shown.summary,
+                        "location": shown.get_text("LOCATION"),
+                        "description": shown.get_text("DESCRIPTION"),
+                        "start": _render(occ["start"]),
+                        "end": _render(occ["end"]),
+                        "all_day": not isinstance(occ["start"], datetime),
+                        "recurring": occ["recurring"],
+                        "calendar": cal["name"],
+                        "href": item["href"],
+                        "etag": item["etag"],
+                        "_sort": _as_instant(occ["start"]),
+                    })
+    out.sort(key=lambda e: e["_sort"])
+    for entry in out:
+        del entry["_sort"]
+    return out[:limit] if limit else out
+
+
+def _overrides(ical_text):
+    """Map (uid, original-start-instant) -> override VEvent."""
+    result = {}
+    for line_group in [parse_ical(ical_text)]:
+        for ev in line_group:
+            params, raw = ev.get("RECURRENCE-ID")
+            if raw:
+                original, _ = parse_dt(raw, params)
+                result[(ev.uid, _as_instant(original))] = ev
+    return result
+
+
+def _render(value):
+    if isinstance(value, datetime):
+        return value.isoformat()
+    return value.isoformat()
+
+
+def fetch_by_uid(cal_url, uid):
+    """One calendar object by UID, via a UID text-match query (no time range)."""
+    body = (
+        '<c:calendar-query xmlns:c="urn:ietf:params:xml:ns:caldav" '
+        'xmlns:d="DAV:">'
+        '<d:prop><d:getetag/><c:calendar-data/></d:prop>'
+        '<c:filter><c:comp-filter name="VCALENDAR">'
+        '<c:comp-filter name="VEVENT">'
+        '<c:prop-filter name="UID">'
+        f'<c:text-match>{_xml_escape(uid)}</c:text-match>'
+        '</c:prop-filter></c:comp-filter></c:comp-filter></c:filter>'
+        '</c:calendar-query>')
+    try:
+        status, _, raw = request("REPORT", cal_url, body,
+                                 "application/xml; charset=utf-8",
+                                 {"Depth": "1"})
+    except CalDavError as e:
+        if e.status not in (400, 412, 501):
+            raise
+        status = None
+    if status is not None:
+        if status not in (200, 207):
+            raise CalDavError(f"REPORT uid {uid} -> HTTP {status}", status)
+        items = _parse_multistatus(raw)
+        return items[0] if items else None
+    # iCloud answers some UID text-match queries with 412. Its object
+    # URLs are <uid>.ics inside the collection, so fetch that directly.
+    obj_url = urllib.parse.urljoin(
+        cal_url, urllib.parse.quote(uid, safe="") + ".ics")
+    status, headers, raw = request("GET", obj_url,
+                                   allow_statuses=(200, 404))
+    if status == 404:
+        return None
+    etag = headers.get("ETag", "").strip('"') or None
+    return {"href": urllib.parse.urlparse(obj_url).path,
+            "etag": etag, "ical": raw.decode("utf-8")}
+
+
+def _xml_escape(text):
+    return (text.replace("&", "&amp;").replace("<", "&lt;")
+            .replace(">", "&gt;"))
+
+
+# --------------------------------------------------------------------------
+# Commands
+# --------------------------------------------------------------------------
+
+def out(obj):
+    json.dump(obj, sys.stdout, ensure_ascii=False, indent=2)
+    sys.stdout.write("\n")
+
+
+def cmd_status(_args):
+    try:
+        dynamic_credential_entry(CREDENTIAL, ENTRY)
+        present = True
+    except DynamicCredentialError:
+        present = False
+    out({"ok": present, "credentials": {CREDENTIAL: present},
+         "note": "this proves the base connection exists. The partition "
+                 "host is only learned from discovery, so its connection "
+                 "(custom.icloud-calendar-p<NN>, same value, one per "
+                 "account) is verified by a live `calendars` call."})
+
+
+def cmd_calendars(_args):
+    cals = list_calendars()
+    out({"ok": True, "count": len(cals),
+         "calendars": [{"name": c["name"], "url": c["url"],
+                        "color": c["color"]} for c in cals]})
+
+
+def _window(args):
+    start = _parse_when(args.from_, is_end=False)
+    end = _parse_when(args.to, is_end=True)
+    if isinstance(start, date) and not isinstance(start, datetime):
+        start = datetime.combine(start, time.min,
+                                 tzinfo=_local_tz())
+    if isinstance(end, date) and not isinstance(end, datetime):
+        end = datetime.combine(end, time.min,
+                               tzinfo=_local_tz())
+    return start.astimezone(timezone.utc), end.astimezone(timezone.utc)
+
+
+def _selected_calendars(args):
+    cals = list_calendars()
+    if getattr(args, "calendar", None):
+        return [resolve_calendar(cals, args.calendar)]
+    return cals
+
+
+def cmd_events(args):
+    window_start, window_end = _window(args)
+    events = collect_events(_selected_calendars(args), window_start,
+                            window_end, args.limit)
+    out({"ok": True, "count": len(events), "events": events})
+
+
+def cmd_search(args):
+    window_start, window_end = _window(args)
+    events = collect_events(_selected_calendars(args), window_start,
+                            window_end)
+    needle = args.query.lower()
+    hits = [e for e in events
+            if needle in (e["summary"] or "").lower()
+            or needle in (e["location"] or "").lower()
+            or needle in (e["description"] or "").lower()]
+    out({"ok": True, "count": len(hits), "events": hits[:args.limit]})
+
+
+def cmd_get(args):
+    cals = _selected_calendars(args)
+    for cal in cals:
+        item = fetch_by_uid(cal["url"], args.uid)
+        if item:
+            events = parse_ical(item["ical"])
+            master = next((e for e in events
+                           if e.get("RECURRENCE-ID")[1] is None), None)
+            if master is None:
+                continue
+            start, is_date = master.start()
+            end, _ = master.end(start, is_date)
+            out({"ok": True, "uid": master.uid, "summary": master.summary,
+                 "location": master.get_text("LOCATION"),
+                 "description": master.get_text("DESCRIPTION"),
+                 "start": _render(start), "end": _render(end),
+                 "all_day": is_date, "calendar": cal["name"],
+                 "href": item["href"], "etag": item["etag"],
+                 "ical": item["ical"]})
+            return
+    raise CalDavError(f"no event with UID {args.uid!r}")
+
+
+def _parse_when(text, is_end=False):
+    """CLI time input: ISO date, or ISO datetime with offset or Z."""
+    text = text.strip()
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
+        day = date.fromisoformat(text)
+        return day + timedelta(days=1) if is_end else day
+    parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=_local_tz())
+    return parsed
+
+
+def cmd_create(args):
+    cals = list_calendars()
+    cal = resolve_calendar(cals, args.calendar)
+    if cal is None:
+        raise CalDavError("create needs --calendar")
+    start = _parse_when(args.start)
+    end = _parse_when(args.end, is_end=args.all_day)
+    if not args.all_day and (not isinstance(start, datetime)
+                             or not isinstance(end, datetime)):
+        raise CalDavError("timed events need full ISO datetimes")
+    uid = f"{uuid.uuid4()}@muse.icloud-calendar"
+    ical = build_ical(uid, args.summary, start, end, args.all_day,
+                      args.location, args.description, args.rrule)
+    url = cal["url"].rstrip("/") + f"/{uid}.ics"
+    status, headers, _ = request(
+        "PUT", url, ical, "text/calendar; charset=utf-8",
+        {"If-None-Match": "*"}, allow_statuses=(201, 204))
+    if status not in (200, 201, 204):
+        raise CalDavError(f"PUT {url} -> HTTP {status}", status)
+    out({"ok": True, "uid": uid, "calendar": cal["name"], "href": url,
+         "etag": (headers.get("ETag") or "").strip('"') or None,
+         "summary": args.summary,
+         "start": _render(start if not args.all_day else
+                          (start.date() if isinstance(start, datetime)
+                           else start)),
+         "end": _render(end if not args.all_day else
+                        (end.date() if isinstance(end, datetime) else end))})
+
+
+def _replace_prop(ical_text, name, new_line):
+    lines = unfold(ical_text)
+    out_lines = []
+    done = False
+    for line in lines:
+        prop_name, _, _ = split_prop(line)
+        if prop_name == name and not done:
+            if new_line is not None:
+                out_lines.append(new_line)
+            done = True
+            continue
+        out_lines.append(line)
+    if not done and new_line is not None:
+        # insert before END:VEVENT of the master (first VEVENT block)
+        idx = out_lines.index("END:VEVENT")
+        out_lines.insert(idx, new_line)
+    return "\r\n".join(out_lines) + "\r\n"
+
+
+def cmd_update(args):
+    cals = _selected_calendars(args)
+    item = None
+    cal = None
+    for candidate in cals:
+        item = fetch_by_uid(candidate["url"], args.uid)
+        if item:
+            cal = candidate
+            break
+    if not item:
+        raise CalDavError(f"no event with UID {args.uid!r}")
+    url = urllib.parse.urljoin(cal["url"], item["href"])
+    ical = item["ical"]
+    if args.summary is not None:
+        ical = _replace_prop(ical, "SUMMARY",
+                             f"SUMMARY:{escape_text(args.summary)}")
+    if args.location is not None:
+        ical = _replace_prop(ical, "LOCATION",
+                             f"LOCATION:{escape_text(args.location)}"
+                             if args.location else None)
+    if args.description is not None:
+        ical = _replace_prop(ical, "DESCRIPTION",
+                             f"DESCRIPTION:{escape_text(args.description)}"
+                             if args.description else None)
+    if args.start is not None or args.end is not None:
+        events = parse_ical(ical)
+        master = next(e for e in events
+                      if e.get("RECURRENCE-ID")[1] is None)
+        cur_start, is_date = master.start()
+        cur_end, _ = master.end(cur_start, is_date)
+        new_start = _parse_when(args.start) if args.start else cur_start
+        new_end = _parse_when(args.end, is_end=is_date) if args.end else cur_end
+        wants_time = (isinstance(new_start, datetime)
+                      or isinstance(new_end, datetime))
+        if is_date and not wants_time:
+            ical = _replace_prop(
+                ical, "DTSTART",
+                f"DTSTART;VALUE=DATE:{new_start.strftime('%Y%m%d')}")
+            ical = _replace_prop(
+                ical, "DTEND",
+                f"DTEND;VALUE=DATE:{new_end.strftime('%Y%m%d')}")
+        else:
+            # A timed value for an all-day event converts it to a timed
+            # event; a bare date alongside becomes local midnight.
+            if not isinstance(new_start, datetime):
+                new_start = datetime.combine(
+                    new_start, datetime.min.time(),
+                    tzinfo=_local_tz())
+            if not isinstance(new_end, datetime):
+                new_end = datetime.combine(
+                    new_end, datetime.min.time(),
+                    tzinfo=_local_tz())
+            for label, value in (("DTSTART", new_start), ("DTEND", new_end)):
+                rendered, params, _ = format_dt(value)
+                param_str = "".join(f";{k}={v}" for k, v in params.items())
+                ical = _replace_prop(ical, label, f"{label}{param_str}:{rendered}")
+    headers = {"If-Match": f'"{item["etag"]}"'} if item["etag"] else {}
+    status, resp_headers, _ = request("PUT", url, ical,
+                                      "text/calendar; charset=utf-8", headers,
+                                      allow_statuses=(200, 201, 204, 412))
+    if status == 412:
+        raise CalDavError("event changed on the server since it was read "
+                          "(ETag mismatch). Re-read it and retry.", 412)
+    if status not in (200, 201, 204):
+        raise CalDavError(f"PUT {url} -> HTTP {status}", status)
+    out({"ok": True, "uid": args.uid, "calendar": cal["name"], "href": url,
+         "etag": (resp_headers.get("ETag") or "").strip('"') or None})
+
+
+def cmd_delete(args):
+    cals = _selected_calendars(args)
+    for cal in cals:
+        item = fetch_by_uid(cal["url"], args.uid)
+        if not item:
+            continue
+        url = urllib.parse.urljoin(cal["url"], item["href"])
+        headers = {"If-Match": f'"{item["etag"]}"'} if item["etag"] else {}
+        status, _, _ = request("DELETE", url, None, None, headers,
+                               allow_statuses=(200, 204, 404, 412))
+        if status == 412:
+            raise CalDavError("event changed on the server since it was read "
+                              "(ETag mismatch). Re-read it and retry.", 412)
+        if status == 404:
+            raise CalDavError(f"event {args.uid!r} already gone", 404)
+        out({"ok": True, "uid": args.uid, "calendar": cal["name"],
+             "href": url, "deleted": True})
+        return
+    raise CalDavError(f"no event with UID {args.uid!r}")
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        prog="icloud-calendar",
+        description="iCloud Calendar over CalDAV (Muse custom connector)")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    sub.add_parser("status", help="check the stored credential entry")
+    sub.add_parser("calendars", help="list calendars (live discovery)")
+
+    p = sub.add_parser("events", help="expanded events in a window")
+    p.add_argument("--from", dest="from_", required=True)
+    p.add_argument("--to", required=True)
+    p.add_argument("--calendar")
+    p.add_argument("--limit", type=int)
+
+    p = sub.add_parser("search", help="text search in a window")
+    p.add_argument("--query", required=True)
+    p.add_argument("--from", dest="from_", required=True)
+    p.add_argument("--to", required=True)
+    p.add_argument("--calendar")
+    p.add_argument("--limit", type=int, default=50)
+
+    p = sub.add_parser("get", help="one event by UID")
+    p.add_argument("--uid", required=True)
+    p.add_argument("--calendar")
+
+    p = sub.add_parser("create", help="create an event")
+    p.add_argument("--calendar", required=True)
+    p.add_argument("--summary", required=True)
+    p.add_argument("--start", required=True)
+    p.add_argument("--end", required=True)
+    p.add_argument("--all-day", action="store_true")
+    p.add_argument("--location")
+    p.add_argument("--description")
+    p.add_argument("--rrule", help="raw RRULE value, e.g. FREQ=WEEKLY;COUNT=4")
+
+    p = sub.add_parser("update", help="patch fields of an event by UID")
+    p.add_argument("--uid", required=True)
+    p.add_argument("--calendar")
+    p.add_argument("--summary")
+    p.add_argument("--location")
+    p.add_argument("--description")
+    p.add_argument("--start")
+    p.add_argument("--end")
+
+    p = sub.add_parser("delete", help="delete an event by UID")
+    p.add_argument("--uid", required=True)
+    p.add_argument("--calendar")
+
+    args = parser.parse_args(argv)
+    handlers = {"status": cmd_status, "calendars": cmd_calendars,
+                "events": cmd_events, "search": cmd_search, "get": cmd_get,
+                "create": cmd_create, "update": cmd_update,
+                "delete": cmd_delete}
+    try:
+        handlers[args.command](args)
+        return 0
+    except DynamicCredentialError as e:
+        print(json.dumps({"ok": False, "error": f"credential: {e}"}),
+              file=sys.stderr)
+        return 2
+    except CalDavError as e:
+        print(json.dumps({"ok": False, "error": str(e),
+                          "status": e.status}), file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
